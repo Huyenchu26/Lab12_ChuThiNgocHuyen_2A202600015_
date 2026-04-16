@@ -272,6 +272,13 @@ railway domain
 
 **Nhiệm vụ:** Test public URL với curl hoặc Postman.
 
+<!-- curl https://student-app.railway.app/health
+
+
+curl -X POST https://student-app.railway.app/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "test"}' -->
+
 ### 📝 Exercise 3.2: Deploy Render (15 phút)
 
 ```bash
