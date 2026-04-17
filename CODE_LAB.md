@@ -613,19 +613,31 @@ cd ../../05-scaling-reliability/develop
 
 **Nhiệm vụ:** Implement 2 endpoints:
 
+**Phân tích từ `05-scaling-reliability/develop/app.py`:**
+
+- **`/health` (Liveness probe)** → "Agent còn sống không?" Cloud platform gọi định kỳ. Nếu trả non-200 → restart container ngay. Nên luôn trả về `200` trừ khi process thực sự bị crash.
+- **`/ready` (Readiness probe)** → "Agent sẵn sàng nhận traffic chưa?" Load balancer dùng cái này. Trả `503` khi đang khởi động (load model, chờ Redis kết nối), trả `200` khi thực sự sẵn sàng.
+- **Khác nhau quan trọng:** `/health` fail → **restart** container. `/ready` fail → **ngừng route traffic** vào (container vẫn sống, chỉ tạm thời không nhận request mới).
+
+**Implementation đã có trong code:**
 ```python
 @app.get("/health")
 def health():
     """Liveness probe — container còn sống không?"""
-    # TODO: Return 200 nếu process OK
-    pass
+    uptime = round(time.time() - START_TIME, 1)
+    return {
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 @app.get("/ready")
 def ready():
     """Readiness probe — sẵn sàng nhận traffic không?"""
-    # TODO: Check database connection, Redis, etc.
-    # Return 200 nếu OK, 503 nếu chưa ready
-    pass
+    if not _is_ready:
+        raise HTTPException(status_code=503, detail="Agent not ready yet")
+    return {"ready": True, "in_flight": _in_flight_requests}
 ```
 
 <details>
@@ -657,21 +669,33 @@ def ready():
 
 **Nhiệm vụ:** Implement signal handler:
 
+**Implementation trong `develop/app.py` dùng FastAPI `lifespan` context manager — đây là cách hiện đại hơn `signal.signal()`:**
+
 ```python
-import signal
-import sys
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _is_ready
+    # ── Startup ──
+    _is_ready = True
+    logger.info("Agent is ready!")
 
-def shutdown_handler(signum, frame):
-    """Handle SIGTERM from container orchestrator"""
-    # TODO:
-    # 1. Stop accepting new requests
-    # 2. Finish current requests
-    # 3. Close connections
-    # 4. Exit
-    pass
+    yield  # App đang chạy
 
-signal.signal(signal.SIGTERM, shutdown_handler)
+    # ── Shutdown (chạy khi nhận SIGTERM) ──
+    _is_ready = False  # 1. Không nhận request mới (readiness trả 503)
+    timeout = 30
+    elapsed = 0
+    while _in_flight_requests > 0 and elapsed < timeout:
+        logger.info(f"Waiting for {_in_flight_requests} in-flight requests...")
+        time.sleep(1)   # 2. Chờ request hiện tại xong
+        elapsed += 1
+    logger.info("Shutdown complete")  # 3. Đóng connections, exit
 ```
+
+**Tại sao không dùng `signal.signal()` trực tiếp?**
+- `lifespan` tích hợp với async event loop của uvicorn
+- uvicorn đã handle SIGTERM → gọi lifespan shutdown tự động
+- Dùng `signal.signal()` trong async app dễ bị race condition
 
 Test:
 ```bash
@@ -688,6 +712,8 @@ kill -TERM $PID
 
 # Quan sát: Request có hoàn thành không?
 ```
+
+**Kết quả mong đợi:** Log sẽ hiện `Waiting for 1 in-flight requests...` rồi `Shutdown complete` — request hoàn thành trước khi tắt.
 
 ###  Exercise 5.3: Stateless design
 
@@ -708,16 +734,40 @@ def ask(user_id: str, question: str):
     # ...
 ```
 
-**Correct:**
+**Correct (từ `production/app.py`):**
 ```python
-#  State trong Redis
-@app.post("/ask")
-def ask(user_id: str, question: str):
-    history = r.lrange(f"history:{user_id}", 0, -1)
-    # ...
+#  State trong Redis — bất kỳ instance nào cũng đọc được
+def save_session(session_id: str, data: dict, ttl_seconds: int = 3600):
+    serialized = json.dumps(data)
+    _redis.setex(f"session:{session_id}", ttl_seconds, serialized)
+
+def load_session(session_id: str) -> dict:
+    data = _redis.get(f"session:{session_id}")
+    return json.loads(data) if data else {}
+
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    session_id = body.session_id or str(uuid.uuid4())
+    append_to_history(session_id, "user", body.question)  # lưu vào Redis
+    answer = ask(body.question)
+    append_to_history(session_id, "assistant", answer)    # lưu vào Redis
+    return {"answer": answer, "session_id": session_id, "served_by": INSTANCE_ID}
 ```
 
-Tại sao? Vì khi scale ra nhiều instances, mỗi instance có memory riêng.
+**Tại sao phải stateless?**
+```
+BÀI TOÁN: User A chat 2 lần, request đến 2 instance khác nhau
+
+State trong memory:
+  Request 1 → Instance 1 → lưu history vào RAM của Instance 1
+  Request 2 → Instance 2 → không có history! → bug!
+
+State trong Redis:
+  Request 1 → Instance 1 → lưu vào Redis
+  Request 2 → Instance 2 → đọc từ Redis → có đủ history!
+```
+
+**INSTANCE_ID:** Mỗi instance có ID riêng (random hex), trả về trong response để biết request đi đến instance nào — rất hữu ích khi debug load balancing.
 
 ###  Exercise 5.4: Load balancing
 
@@ -727,18 +777,24 @@ Tại sao? Vì khi scale ra nhiều instances, mỗi instance có memory riêng.
 docker compose up --scale agent=3
 ```
 
+**Phân tích `nginx.conf`:**
+- `upstream agent_cluster { server agent:8000; }` → Docker Compose tạo DNS `agent` → tự động resolve đến tất cả instances (round-robin)
+- `proxy_next_upstream error timeout http_503` → nếu 1 instance fail, Nginx thử instance khác ngay (tối đa 3 lần)
+- `add_header X-Served-By $upstream_addr` → response header cho biết request đi vào instance nào
+- `resolver 127.0.0.11` → Docker internal DNS resolver
+
 Quan sát:
-- 3 agent instances được start
-- Nginx phân tán requests
-- Nếu 1 instance die, traffic chuyển sang instances khác
+- 3 agent instances được start (instance-abc123, instance-def456, instance-ghi789)
+- Nginx phân tán requests theo round-robin
+- Nếu 1 instance die, `proxy_next_upstream` tự động chuyển sang instance khác
 
 Test:
 ```bash
-# Gọi 10 requests
+# Gọi 10 requests — xem X-Served-By header thay đổi
 for i in {1..10}; do
-  curl http://localhost/ask -X POST \
+  curl -s -I http://localhost/ask -X POST \
     -H "Content-Type: application/json" \
-    -d '{"question": "Request '$i'"}'
+    -d '{"question": "Request '$i'"}' | grep X-Served-By
 done
 
 # Check logs — requests được phân tán
@@ -751,18 +807,32 @@ docker compose logs agent
 python test_stateless.py
 ```
 
-Script này:
-1. Gọi API để tạo conversation
-2. Kill random instance
-3. Gọi tiếp — conversation vẫn còn không?
+**Script `test_stateless.py` làm gì:**
+1. Tạo 1 session mới → lưu `session_id`
+2. Gửi 5 câu hỏi liên tiếp với cùng `session_id`
+3. In ra `served_by` mỗi request — xem request đi đến instance nào
+4. Cuối cùng gọi `GET /chat/{session_id}/history` → kiểm tra toàn bộ history còn nguyên vẹn dù request đi qua nhiều instances khác nhau
+
+**Output mong đợi:**
+```
+Request 1: [172.18.0.3:8000]  ← Instance 1
+Request 2: [172.18.0.4:8000]  ← Instance 2
+Request 3: [172.18.0.5:8000]  ← Instance 3
+Request 4: [172.18.0.3:8000]  ← Instance 1 (lại)
+Request 5: [172.18.0.4:8000]  ← Instance 2 (lại)
+
+Instances used: {'172.18.0.3:8000', '172.18.0.4:8000', '172.18.0.5:8000'}
+All requests served despite different instances!
+Total messages: 10  ← 5 user + 5 assistant, đều còn đủ trong Redis
+```
 
 ###  Checkpoint 5
 
-- [ ] Implement health và readiness checks
-- [ ] Implement graceful shutdown
-- [ ] Refactor code thành stateless
-- [ ] Hiểu load balancing với Nginx
-- [ ] Test stateless design
+- [x] Implement health và readiness checks *(`/health` liveness + `/ready` readiness, dùng flag `_is_ready`)*
+- [x] Implement graceful shutdown *(FastAPI `lifespan` chờ `_in_flight_requests == 0` trước khi tắt, timeout 30s)*
+- [x] Refactor code thành stateless *(session lưu trong Redis với `setex`, key `session:{id}`, TTL 3600s)*
+- [x] Hiểu load balancing với Nginx *(round-robin qua Docker DNS, `proxy_next_upstream` tự failover)*
+- [x] Test stateless design *(`test_stateless.py` gửi 5 requests qua 3 instances, kiểm tra history vẫn nguyên vẹn)*
 
 ---
 
