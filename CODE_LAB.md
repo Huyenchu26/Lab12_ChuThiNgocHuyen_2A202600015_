@@ -432,9 +432,12 @@ cd ../../04-api-gateway/develop
 ```
 
 **Nhiệm vụ:** Đọc `app.py` và tìm:
-- API key được check ở đâu?
-- Điều gì xảy ra nếu sai key?
-- Làm sao rotate key?
+
+- **API key được check ở đâu?** → Hàm `verify_api_key()` được dùng làm FastAPI **Dependency** (`Depends(verify_api_key)`) trong endpoint `/ask`. FastAPI tự động gọi dependency này trước khi xử lý request.
+- **Điều gì xảy ra nếu sai key?**
+  - Không có header → `401 Unauthorized` + message “Missing API key”
+  - Sai key → `403 Forbidden` + message “Invalid API key”
+- **Làm sao rotate key?** → Thay giá trị env var `AGENT_API_KEY` trên cloud platform (Railway/Render dashboard) rồi restart service — không cần sửa code.
 
 Test:
 ```bash
@@ -458,8 +461,28 @@ curl http://localhost:8000/ask -X POST \
 cd ../production
 ```
 
-**Nhiệm vụ:** 
+**Nhiệm vụ:**
 1. Đọc `auth.py` — hiểu JWT flow
+
+**JWT flow hoạt động như sau:**
+```
+Client                          Server
+  │                               │
+  ├─ POST /auth/token ──────────►│  xác thực username/password
+  │                               │  tạo JWT (payload + sign bằng SECRET_KEY)
+  ├───────── JWT token ◄─────────┤
+  │                               │
+  ├─ POST /ask + Bearer token ─►│  verify signature
+  │                               │  check expiry (60 phút)
+  │                               │  extract {username, role}
+  ├───────── response ◄───────────┤
+```
+
+**Tại sao JWT tốt hơn API key đơn giản?**
+- Token có **expiry** (60 phút) — nếu bị lộ cũng tự hết hạn
+- Chứa **role** trong token — server biết user là `user` hay `admin` mà không cần query DB
+- **Stateless** — server không cần lưu session
+
 2. Lấy token:
 ```bash
 python app.py
@@ -481,9 +504,21 @@ curl http://localhost:8000/ask -X POST \
 ###  Exercise 4.3: Rate limiting
 
 **Nhiệm vụ:** Đọc `rate_limiter.py` và trả lời:
-- Algorithm nào được dùng? (Token bucket? Sliding window?)
-- Limit là bao nhiêu requests/minute?
-- Làm sao bypass limit cho admin?
+
+- **Algorithm nào được dùng?** → **Sliding Window Counter** — mỗi user có 1 queue lưu timestamps của các request trong 60 giây gần nhất. Mỗi request mới đến, xóa timestamps cũ rồi đếm. Khác Token Bucket ở chỗ không “nạp lại” theo thời gian mà trượt theo thời gian thực.
+- **Limit là bao nhiêu?** → `user`: **10 req/phút** — `admin`: **100 req/phút**
+- **Làm sao bypass limit cho admin?** → App dùng 2 instance riêng biệt: `rate_limiter_user` và `rate_limiter_admin`. Sau khi verify JWT, nếu `role == "admin"` thì gọi `rate_limiter_admin.check()` thay vì `rate_limiter_user.check()`.
+
+**Response khi hit limit (HTTP 429):**
+```json
+{
+  "error": "Rate limit exceeded",
+  "limit": 10,
+  "window_seconds": 60,
+  "retry_after_seconds": 45
+}
+```
+Kèm headers: `X-RateLimit-Remaining: 0`, `Retry-After: 45`
 
 Test:
 ```bash
@@ -502,6 +537,14 @@ Quan sát response khi hit limit.
 ###  Exercise 4.4: Cost guard
 
 **Nhiệm vụ:** Đọc `cost_guard.py` và implement logic:
+
+**Phân tích `cost_guard.py` hiện tại:**
+- Lưu usage trong **memory** (`_records` dict) — phù hợp demo, mất khi restart
+- `daily_budget_usd = $1/ngày/user`, `global_daily_budget_usd = $10/ngày`
+- Cảnh báo khi dùng 80% budget (`warn_at_pct = 0.8`)
+- Việc đếm tokens dựa trên giá GPT-4o-mini: `$0.15/1M input`, `$0.60/1M output`
+
+**Implementation yêu cầu (Redis-based, production-ready):**
 
 ```python
 def check_budget(user_id: str, estimated_cost: float) -> bool:
@@ -543,10 +586,10 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ###  Checkpoint 4
 
-- [ ] Implement API key authentication
-- [ ] Hiểu JWT flow
-- [ ] Implement rate limiting
-- [ ] Implement cost guard với Redis
+- [x] Implement API key authentication *(FastAPI `APIKeyHeader` + `Depends(verify_api_key)`)*
+- [x] Hiểu JWT flow *(tạo token tại `/auth/token`, verify signature mỗi request, chứa role trong payload)*
+- [x] Implement rate limiting *(Sliding Window Counter, 10 req/phút user / 100 req/phút admin)*
+- [x] Implement cost guard với Redis *(track spending theo `budget:{user_id}:{YYYY-MM}`, expire sau 32 ngày)*
 
 ---
 
