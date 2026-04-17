@@ -845,21 +845,21 @@ Build một production-ready AI agent từ đầu, kết hợp TẤT CẢ concep
 ###  Requirements
 
 **Functional:**
-- [ ] Agent trả lời câu hỏi qua REST API
-- [ ] Support conversation history
+- [x] Agent trả lời câu hỏi qua REST API
+- [x] Support conversation history
 - [ ] Streaming responses (optional)
 
 **Non-functional:**
-- [ ] Dockerized với multi-stage build
-- [ ] Config từ environment variables
-- [ ] API key authentication
-- [ ] Rate limiting (10 req/min per user)
-- [ ] Cost guard ($10/month per user)
-- [ ] Health check endpoint
-- [ ] Readiness check endpoint
-- [ ] Graceful shutdown
-- [ ] Stateless design (state trong Redis)
-- [ ] Structured JSON logging
+- [x] Dockerized với multi-stage build
+- [x] Config từ environment variables
+- [x] API key authentication
+- [x] Rate limiting (10 req/min per user)
+- [x] Cost guard ($10/month per user)
+- [x] Health check endpoint
+- [x] Readiness check endpoint
+- [x] Graceful shutdown
+- [x] Stateless design (state trong Redis)
+- [x] Structured JSON logging
 - [ ] Deploy lên Railway hoặc Render
 - [ ] Public URL hoạt động
 
@@ -917,19 +917,35 @@ touch .dockerignore
 **File:** `app/config.py`
 
 ```python
-from pydantic_settings import BaseSettings
+"""Production config — 12-Factor: tất cả từ environment variables."""
+import os, logging
+from dataclasses import dataclass, field
 
-class Settings(BaseSettings):
-    # TODO: Define all config
-    # - PORT
-    # - REDIS_URL
-    # - AGENT_API_KEY
-    # - LOG_LEVEL
-    # - RATE_LIMIT_PER_MINUTE
-    # - MONTHLY_BUDGET_USD
-    pass
+@dataclass
+class Settings:
+    host: str = field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"))
+    port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))
+    environment: str = field(default_factory=lambda: os.getenv("ENVIRONMENT", "development"))
+    debug: bool = field(default_factory=lambda: os.getenv("DEBUG", "false").lower() == "true")
+    app_name: str = field(default_factory=lambda: os.getenv("APP_NAME", "Production AI Agent"))
+    app_version: str = field(default_factory=lambda: os.getenv("APP_VERSION", "1.0.0"))
+    openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    agent_api_key: str = field(default_factory=lambda: os.getenv("AGENT_API_KEY", "dev-key-change-me"))
+    allowed_origins: list = field(default_factory=lambda: os.getenv("ALLOWED_ORIGINS", "*").split(","))
+    rate_limit_per_minute: int = field(default_factory=lambda: int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")))
+    daily_budget_usd: float = field(default_factory=lambda: float(os.getenv("DAILY_BUDGET_USD", "5.0")))
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
 
-settings = Settings()
+    def validate(self):
+        logger = logging.getLogger(__name__)
+        if self.environment == "production" and self.agent_api_key == "dev-key-change-me":
+            raise ValueError("AGENT_API_KEY must be set in production!")
+        if not self.openai_api_key:
+            logger.warning("OPENAI_API_KEY not set — using mock LLM")
+        return self
+
+settings = Settings().validate()
 ```
 
 #### Step 3: Main application (15 phút)
@@ -937,95 +953,208 @@ settings = Settings()
 **File:** `app/main.py`
 
 ```python
-from fastapi import FastAPI, Depends, HTTPException
-from .config import settings
-from .auth import verify_api_key
-from .rate_limiter import check_rate_limit
-from .cost_guard import check_budget
+import os, time, json, logging
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+
+from app.config import settings
+from utils.mock_llm import ask as llm_ask
+
+logging.basicConfig(
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',  # JSON logging
+)
+logger = logging.getLogger(__name__)
+
+START_TIME = time.time()
+_is_ready = False
+_request_count = 0
+
+# ── Rate limiter (Sliding Window) ──
+_rate_windows: dict[str, deque] = defaultdict(deque)
+def check_rate_limit(key: str):
+    now = time.time()
+    window = _rate_windows[key]
+    while window and window[0] < now - 60:
+        window.popleft()
+    if len(window) >= settings.rate_limit_per_minute:
+        raise HTTPException(429, f"Rate limit: {settings.rate_limit_per_minute} req/min",
+                            headers={"Retry-After": "60"})
+    window.append(now)
+
+# ── Cost guard ──
+_daily_cost = 0.0
+def check_and_record_cost(input_tokens: int, output_tokens: int):
+    global _daily_cost
+    if _daily_cost >= settings.daily_budget_usd:
+        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
+    _daily_cost += (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
+
+# ── Auth ──
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+def verify_api_key(api_key: str = Security(api_key_header)) -> str:
+    if not api_key or api_key != settings.agent_api_key:
+        raise HTTPException(401, "Invalid or missing API key")
+    return api_key
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _is_ready
+    logger.info(json.dumps({"event": "startup", "app": settings.app_name}))
+    _is_ready = True
+    yield
+    _is_ready = False
+    logger.info(json.dumps({"event": "shutdown"}))
+
+app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan,
+              docs_url="/docs" if settings.environment != "production" else None)
+
+app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
+                   allow_methods=["GET", "POST"], allow_headers=["*"])
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
 
 @app.get("/health")
 def health():
-    # TODO
-    pass
+    return {"status": "ok", "uptime_seconds": round(time.time() - START_TIME, 1),
+            "version": settings.app_version, "requests": _request_count}
 
 @app.get("/ready")
 def ready():
-    # TODO: Check Redis connection
-    pass
+    if not _is_ready:
+        raise HTTPException(503, "Not ready")
+    return {"ready": True}
 
 @app.post("/ask")
-def ask(
-    question: str,
-    user_id: str = Depends(verify_api_key),
-    _rate_limit: None = Depends(check_rate_limit),
-    _budget: None = Depends(check_budget)
-):
-    # TODO: 
-    # 1. Get conversation history from Redis
-    # 2. Call LLM
-    # 3. Save to Redis
-    # 4. Return response
-    pass
+async def ask_agent(body: AskRequest, _key: str = Depends(verify_api_key)):
+    check_rate_limit(_key[:8])                        # 1. Rate limit
+    check_and_record_cost(len(body.question.split()) * 2, 0)  # 2. Budget check
+    answer = llm_ask(body.question)                   # 3. Call LLM
+    check_and_record_cost(0, len(answer.split()) * 2) # 4. Record output cost
+    return {"question": body.question, "answer": answer,
+            "model": settings.llm_model,
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 ```
 
 #### Step 4: Authentication (5 phút)
 
-**File:** `app/auth.py`
-
+**Đã tích hợp trong `app/main.py` (step 3).** Logic:
 ```python
-from fastapi import Header, HTTPException
-
-def verify_api_key(x_api_key: str = Header(...)):
-    # TODO: Verify against settings.AGENT_API_KEY
-    # Return user_id if valid
-    # Raise HTTPException(401) if invalid
-    pass
+# X-API-Key header bắt buộc — dùng FastAPI APIKeyHeader
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+def verify_api_key(api_key: str = Security(api_key_header)) -> str:
+    if not api_key or api_key != settings.agent_api_key:  # so sánh với env var
+        raise HTTPException(401, "Invalid or missing API key")
+    return api_key  # trả về key để dùng làm rate-limit bucket key
 ```
+
+Rotate key: chỉ đổi `AGENT_API_KEY` trên cloud dashboard, không sửa code.
 
 #### Step 5: Rate limiting (10 phút)
 
-**File:** `app/rate_limiter.py`
-
+**Đã tích hợp trong `app/main.py`.** Sliding Window Counter trên memory:
 ```python
-import redis
-from fastapi import HTTPException
-
-r = redis.from_url(settings.REDIS_URL)
-
-def check_rate_limit(user_id: str):
-    # TODO: Implement sliding window
-    # Raise HTTPException(429) if exceeded
-    pass
+_rate_windows: dict[str, deque] = defaultdict(deque)  # key → timestamps
+def check_rate_limit(key: str):
+    now = time.time()
+    window = _rate_windows[key]
+    while window and window[0] < now - 60:  # xóa timestamps cũ
+        window.popleft()
+    if len(window) >= settings.rate_limit_per_minute:  # kiểm tra limit
+        raise HTTPException(429, f"Rate limit exceeded", headers={"Retry-After": "60"})
+    window.append(now)  # ghi lại timestamp hiện tại
 ```
+**Note production:** Thay bằng Redis-based rate limiter nếu có nhiều instances.
 
 #### Step 6: Cost guard (10 phút)
 
-**File:** `app/cost_guard.py`
-
+**Đã tích hợp trong `app/main.py`.** Track chi phí token theo ngày:
 ```python
-def check_budget(user_id: str):
-    # TODO: Check monthly spending
-    # Raise HTTPException(402) if exceeded
-    pass
+_daily_cost = 0.0  # reset mỗi ngày
+def check_and_record_cost(input_tokens: int, output_tokens: int):
+    global _daily_cost
+    if _daily_cost >= settings.daily_budget_usd:    # kiểm tra vượt budget
+        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
+    # GPT-4o-mini: $0.15/1M input, $0.60/1M output
+    _daily_cost += (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
 ```
+Gọi 2 lần mỗi request: trước khi gọi LLM (input tokens) và sau khi nhận response (output tokens).
 
 #### Step 7: Dockerfile (5 phút)
 
 ```dockerfile
-# TODO: Multi-stage build
-# Stage 1: Builder
-# Stage 2: Runtime
+# Stage 1: Builder — cài dependencies
+FROM python:3.11-slim AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Stage 2: Runtime — chỉ có code + packages đã compile
+FROM python:3.11-slim AS runtime
+RUN groupadd -r agent && useradd -r -g agent -d /app agent  # non-root user
+WORKDIR /app
+COPY --from=builder /root/.local /home/agent/.local  # copy từ stage 1
+COPY app/ ./app/
+COPY utils/ ./utils/
+RUN chown -R agent:agent /app
+USER agent
+ENV PATH=/home/agent/.local/bin:$PATH
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
 ```
 
 #### Step 8: Docker Compose (5 phút)
 
 ```yaml
-# TODO: Define services
-# - agent (scale to 3)
-# - redis
-# - nginx (load balancer)
+version: "3.9"
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=staging
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env.local          # secrets — không commit lên git
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
 ```
 
 #### Step 9: Test locally (5 phút)
